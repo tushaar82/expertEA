@@ -1,0 +1,674 @@
+//+------------------------------------------------------------------+
+//|                                              CandlePatternEA.mq5 |
+//|                        Candle Open=High/Low Strategy with Martingale|
+//+------------------------------------------------------------------+
+#property copyright "Custom EA"
+#property link      ""
+#property version   "1.00"
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| Input Parameters                                                   |
+//+------------------------------------------------------------------+
+input group "=== Trade Settings ==="
+input double   InpLotSize        = 0.01;         // Initial Lot Size
+input int      InpMagicNumber    = 123456;       // Magic Number
+input int      InpSlippage       = 30;           // Slippage (points)
+input int      InpMaxOrders      = 5;            // Max Martingale Orders
+
+input group "=== EMA Filter ==="
+input bool     InpUseEMAFilter   = false;        // Use 50 EMA Filter
+input int      InpEMAPeriod      = 50;           // EMA Period
+input ENUM_APPLIED_PRICE InpEMAPrice = PRICE_CLOSE; // EMA Applied Price
+
+input group "=== Trading Hours ==="
+input bool     InpUseTimeFilter  = false;        // Use Time Filter
+input int      InpStartHour      = 8;            // Trading Start Hour
+input int      InpEndHour        = 20;           // Trading End Hour
+
+//+------------------------------------------------------------------+
+//| Global Variables                                                   |
+//+------------------------------------------------------------------+
+CTrade         m_trade;
+int            m_emaHandle;
+double         m_emaBuffer[];
+datetime       m_lastBarTime;
+bool           m_inMartingaleBuy  = false;
+bool           m_inMartingaleSell = false;
+double         m_combinedBuyTP    = 0;
+double         m_combinedSellTP   = 0;
+double         m_totalBuyLots     = 0;
+double         m_totalSellLots    = 0;
+double         m_weightedBuyPrice = 0;
+double         m_weightedSellPrice= 0;
+int            m_buyOrderCount    = 0;
+int            m_sellOrderCount   = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                     |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   m_trade.SetExpertMagicNumber(InpMagicNumber);
+   m_trade.SetDeviationInPoints(InpSlippage);
+   m_trade.SetTypeFilling(ORDER_FILLING_IOC);
+   m_trade.SetAsyncMode(false);
+   
+   if(InpUseEMAFilter)
+   {
+      m_emaHandle = iMA(_Symbol, PERIOD_CURRENT, InpEMAPeriod, 0, MODE_EMA, InpEMAPrice);
+      if(m_emaHandle == INVALID_HANDLE)
+      {
+         Print("Failed to create EMA indicator");
+         return(INIT_FAILED);
+      }
+      ArraySetAsSeries(m_emaBuffer, true);
+   }
+   
+   m_lastBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   
+   // Restore state if positions exist
+   RestoreMartingaleState();
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                   |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(m_emaHandle != INVALID_HANDLE)
+      IndicatorRelease(m_emaHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                               |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(currentBarTime == m_lastBarTime)
+      return;
+   
+   m_lastBarTime = currentBarTime;
+   
+   // Update EMA if used
+   double emaValue = 0;
+   if(InpUseEMAFilter)
+   {
+      if(CopyBuffer(m_emaHandle, 0, 0, 1, m_emaBuffer) < 1)
+         return;
+      emaValue = m_emaBuffer[0];
+   }
+   
+   // Check time filter
+   if(InpUseTimeFilter && !IsTradingTime())
+      return;
+   
+   // Manage existing positions (Martingale logic)
+   ManageMartingalePositions();
+   
+   // Check for new signals only if no martingale in progress
+   if(!m_inMartingaleBuy && !m_inMartingaleSell)
+   {
+      CheckForNewSignals(emaValue);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Check if current time is within trading hours                      |
+//+------------------------------------------------------------------+
+bool IsTradingTime()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int currentHour = dt.hour;
+   return (currentHour >= InpStartHour && currentHour < InpEndHour);
+}
+
+//+------------------------------------------------------------------+
+//| Check for new candle patterns                                      |
+//+------------------------------------------------------------------+
+void CheckForNewSignals(double emaValue)
+{
+   // Get previous candle (index 1) and the one before it (index 2)
+   double open1  = iOpen(_Symbol, PERIOD_CURRENT, 1);
+   double high1  = iHigh(_Symbol, PERIOD_CURRENT, 1);
+   double low1   = iLow(_Symbol, PERIOD_CURRENT, 1);
+   double close1 = iClose(_Symbol, PERIOD_CURRENT, 1);
+   
+   double open2  = iOpen(_Symbol, PERIOD_CURRENT, 2);
+   double high2  = iHigh(_Symbol, PERIOD_CURRENT, 2);
+   double low2   = iLow(_Symbol, PERIOD_CURRENT, 2);
+   
+   double point  = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   // Pattern 1: Previous candle Open = Low (Bullish pin bar / hammer setup) -> SELL on next candle
+   // Target = previous candle's Open (which equals its Low)
+   // SL = distance from entry to target (1:1 R:R)
+   if(NormalizeDouble(open1, digits) == NormalizeDouble(low1, digits))
+   {
+      bool allowSell = true;
+      if(InpUseEMAFilter)
+      {
+         // Below EMA = sell only
+         allowSell = (close1 < emaValue);
+      }
+      
+      if(allowSell && !HasOpenPosition(ORDER_TYPE_SELL))
+      {
+         double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double targetPrice = open1;  // Previous candle's open (which = low)
+         double slDistance = MathAbs(entryPrice - targetPrice);
+         
+         // Ensure minimum SL distance
+         double minSL = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+         if(slDistance < minSL)
+            slDistance = minSL + point;
+         
+         double slPrice = entryPrice + slDistance;
+         double tpPrice = targetPrice;
+         
+         // Adjust for stop level
+         double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+         if(MathAbs(slPrice - entryPrice) < stopLevel)
+            slPrice = entryPrice + stopLevel + point;
+         
+         double lots = CalculateLotSize(1);
+         
+         if(m_trade.Sell(lots, _Symbol, entryPrice, slPrice, tpPrice, "Sell O=L Pattern"))
+         {
+            m_inMartingaleSell = true;
+            m_sellOrderCount = 1;
+            m_combinedSellTP = tpPrice;
+            m_totalSellLots = lots;
+            m_weightedSellPrice = entryPrice;
+            Print("SELL Signal: Open=Low detected. Entry: ", entryPrice, " TP: ", tpPrice, " SL: ", slPrice);
+         }
+      }
+   }
+   
+   // Pattern 2: Previous candle Open = High (Bearish pin bar / shooting star setup) -> BUY on next candle
+   // Target = previous candle's Open (which equals its High)
+   // SL = distance from entry to target (1:1 R:R)
+   if(NormalizeDouble(open1, digits) == NormalizeDouble(high1, digits))
+   {
+      bool allowBuy = true;
+      if(InpUseEMAFilter)
+      {
+         // Above EMA = buy only
+         allowBuy = (close1 > emaValue);
+      }
+      
+      if(allowBuy && !HasOpenPosition(ORDER_TYPE_BUY))
+      {
+         double entryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+         double targetPrice = open1;  // Previous candle's open (which = high)
+         double slDistance = MathAbs(targetPrice - entryPrice);
+         
+         // Ensure minimum SL distance
+         double minSL = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+         if(slDistance < minSL)
+            slDistance = minSL + point;
+         
+         double slPrice = entryPrice - slDistance;
+         double tpPrice = targetPrice;
+         
+         // Adjust for stop level
+         double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+         if(MathAbs(entryPrice - slPrice) < stopLevel)
+            slPrice = entryPrice - stopLevel - point;
+         
+         double lots = CalculateLotSize(1);
+         
+         if(m_trade.Buy(lots, _Symbol, entryPrice, slPrice, tpPrice, "Buy O=H Pattern"))
+         {
+            m_inMartingaleBuy = true;
+            m_buyOrderCount = 1;
+            m_combinedBuyTP = tpPrice;
+            m_totalBuyLots = lots;
+            m_weightedBuyPrice = entryPrice;
+            Print("BUY Signal: Open=High detected. Entry: ", entryPrice, " TP: ", tpPrice, " SL: ", slPrice);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage Martingale Positions                                        |
+//+------------------------------------------------------------------+
+void ManageMartingalePositions()
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   // Check BUY martingale
+   if(m_inMartingaleBuy)
+   {
+      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // Find the highest SL among buy positions (breakeven or last entry SL)
+      double highestSL = 0;
+      double lastEntryPrice = 0;
+      double totalLots = 0;
+      double weightedPrice = 0;
+      
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+         if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_BUY) continue;
+         
+         double posSL = PositionGetDouble(POSITION_SL);
+         double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double posLots = PositionGetDouble(POSITION_VOLUME);
+         
+         if(posSL > highestSL) highestSL = posSL;
+         if(posPrice > lastEntryPrice) lastEntryPrice = posPrice;
+         
+         totalLots += posLots;
+         weightedPrice += posPrice * posLots;
+      }
+      
+      if(totalLots > 0)
+      {
+         weightedPrice /= totalLots;
+         m_totalBuyLots = totalLots;
+         m_weightedBuyPrice = weightedPrice;
+         
+         // Check if we need to add martingale position
+         // Add when price goes against us (below last entry by SL distance)
+         double slDistance = MathAbs(weightedPrice - m_combinedBuyTP); // Original R:R distance
+         
+         // Check if price has moved against us by the SL distance from last entry
+         if(currentAsk <= lastEntryPrice - slDistance && m_buyOrderCount < InpMaxOrders)
+         {
+            // Add new buy position
+            double newLots = CalculateLotSize(m_buyOrderCount + 1);
+            double newSL = currentAsk - slDistance;
+            double newTP = m_combinedBuyTP;
+            
+            // Adjust SL/TP for stop level
+            double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+            if(MathAbs(currentAsk - newSL) < stopLevel)
+               newSL = currentAsk - stopLevel - point;
+            
+            if(m_trade.Buy(newLots, _Symbol, currentAsk, newSL, newTP, "Martingale Buy #" + IntegerToString(m_buyOrderCount + 1)))
+            {
+               m_buyOrderCount++;
+               Print("Martingale BUY #", m_buyOrderCount, " added at ", currentAsk, " Lots: ", newLots);
+               
+               // Update combined TP for all positions to breakeven + profit
+               UpdateCombinedTakeProfit(POSITION_TYPE_BUY);
+            }
+         }
+         
+         // Check if all buy positions hit SL (martingale ended in loss)
+         if(currentBid <= highestSL && highestSL > 0)
+         {
+            CloseAllPositions(POSITION_TYPE_BUY);
+            ResetBuyState();
+            Print("Martingale BUY sequence stopped - SL hit");
+         }
+         
+         // Check if combined TP reached
+         if(currentBid >= m_combinedBuyTP && m_buyOrderCount > 1)
+         {
+            // Close all buy positions at profit
+            CloseAllPositions(POSITION_TYPE_BUY);
+            ResetBuyState();
+            Print("Martingale BUY sequence completed - Combined TP hit");
+         }
+      }
+      else
+      {
+         // No positions found, reset state
+         ResetBuyState();
+      }
+   }
+   
+   // Check SELL martingale
+   if(m_inMartingaleSell)
+   {
+      double currentAsk = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double currentBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      
+      // Find the lowest SL among sell positions
+      double lowestSL = DBL_MAX;
+      double lastEntryPrice = DBL_MAX;
+      double totalLots = 0;
+      double weightedPrice = 0;
+      
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+         if(PositionGetInteger(POSITION_TYPE) != POSITION_TYPE_SELL) continue;
+         
+         double posSL = PositionGetDouble(POSITION_SL);
+         double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+         double posLots = PositionGetDouble(POSITION_VOLUME);
+         
+         if(posSL < lowestSL && posSL > 0) lowestSL = posSL;
+         if(posPrice < lastEntryPrice) lastEntryPrice = posPrice;
+         
+         totalLots += posLots;
+         weightedPrice += posPrice * posLots;
+      }
+      
+      if(totalLots > 0)
+      {
+         weightedPrice /= totalLots;
+         m_totalSellLots = totalLots;
+         m_weightedSellPrice = weightedPrice;
+         
+         // Check if we need to add martingale position
+         double slDistance = MathAbs(m_combinedSellTP - weightedPrice); // Original R:R distance
+         
+         // Check if price has moved against us by the SL distance from last entry
+         if(currentBid >= lastEntryPrice + slDistance && m_sellOrderCount < InpMaxOrders)
+         {
+            // Add new sell position
+            double newLots = CalculateLotSize(m_sellOrderCount + 1);
+            double newSL = currentBid + slDistance;
+            double newTP = m_combinedSellTP;
+            
+            // Adjust SL/TP for stop level
+            double stopLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * point;
+            if(MathAbs(newSL - currentBid) < stopLevel)
+               newSL = currentBid + stopLevel + point;
+            
+            if(m_trade.Sell(newLots, _Symbol, currentBid, newSL, newTP, "Martingale Sell #" + IntegerToString(m_sellOrderCount + 1)))
+            {
+               m_sellOrderCount++;
+               Print("Martingale SELL #", m_sellOrderCount, " added at ", currentBid, " Lots: ", newLots);
+               
+               // Update combined TP for all positions to breakeven + profit
+               UpdateCombinedTakeProfit(POSITION_TYPE_SELL);
+            }
+         }
+         
+         // Check if all sell positions hit SL
+         if(currentAsk >= lowestSL && lowestSL > 0 && lowestSL != DBL_MAX)
+         {
+            CloseAllPositions(POSITION_TYPE_SELL);
+            ResetSellState();
+            Print("Martingale SELL sequence stopped - SL hit");
+         }
+         
+         // Check if combined TP reached
+         if(currentAsk <= m_combinedSellTP && m_sellOrderCount > 1)
+         {
+            CloseAllPositions(POSITION_TYPE_SELL);
+            ResetSellState();
+            Print("Martingale SELL sequence completed - Combined TP hit");
+         }
+      }
+      else
+      {
+         ResetSellState();
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Update Combined Take Profit for Martingale                         |
+//+------------------------------------------------------------------+
+void UpdateCombinedTakeProfit(ENUM_POSITION_TYPE posType)
+{
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   double totalLots = 0;
+   double weightedPrice = 0;
+   
+   // Calculate weighted average price
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE) != posType) continue;
+      
+      double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double posLots = PositionGetDouble(POSITION_VOLUME);
+      
+      totalLots += posLots;
+      weightedPrice += posPrice * posLots;
+   }
+   
+   if(totalLots <= 0) return;
+   
+   weightedPrice /= totalLots;
+   
+   // Calculate combined TP: weighted average price + original profit target
+   // This ensures all positions close at combined breakeven + original target profit
+   double combinedTP;
+   
+   if(posType == POSITION_TYPE_BUY)
+   {
+      // For buys: combined TP = weighted entry + (original target distance)
+      // But we want to ensure profit, so set TP slightly above breakeven
+      double originalTargetDistance = MathAbs(m_weightedBuyPrice - m_combinedBuyTP);
+      combinedTP = weightedPrice + originalTargetDistance;
+      
+      // Ensure TP is better than breakeven
+      if(combinedTP <= weightedPrice)
+         combinedTP = weightedPrice + (originalTargetDistance * 0.5);
+      
+      m_combinedBuyTP = combinedTP;
+      m_totalBuyLots = totalLots;
+      m_weightedBuyPrice = weightedPrice;
+   }
+   else
+   {
+      double originalTargetDistance = MathAbs(m_combinedSellTP - m_weightedSellPrice);
+      combinedTP = weightedPrice - originalTargetDistance;
+      
+      if(combinedTP >= weightedPrice)
+         combinedTP = weightedPrice - (originalTargetDistance * 0.5);
+      
+      m_combinedSellTP = combinedTP;
+      m_totalSellLots = totalLots;
+      m_weightedSellPrice = weightedPrice;
+   }
+   
+   // Modify all positions to use the new combined TP
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE) != posType) continue;
+      
+      // Keep original SL, update TP to combined TP
+      double posSL = PositionGetDouble(POSITION_SL);
+      m_trade.PositionModify(ticket, posSL, combinedTP);
+   }
+   
+   Print("Combined TP updated for ", (posType == POSITION_TYPE_BUY ? "BUY" : "SELL"), 
+         " positions. Weighted Price: ", weightedPrice, " Combined TP: ", combinedTP);
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size for martingale level                              |
+//+------------------------------------------------------------------+
+double CalculateLotSize(int level)
+{
+   double lot = InpLotSize;
+   
+   // Martingale: double the lot size for each level
+   for(int i = 1; i < level; i++)
+   {
+      lot *= 2;
+   }
+   
+   // Get symbol limits
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   
+   // Normalize lot size
+   lot = MathFloor(lot / lotStep) * lotStep;
+   
+   if(lot < minLot) lot = minLot;
+   if(lot > maxLot) lot = maxLot;
+   
+   // Check margin requirements
+   double marginRequired;
+   if(!OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lot, SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginRequired))
+      return minLot;
+   
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   if(marginRequired > freeMargin * 0.5) // Use max 50% of free margin
+   {
+      lot = minLot;
+   }
+   
+   return lot;
+}
+
+//+------------------------------------------------------------------+
+//| Check if position type already exists                              |
+//+------------------------------------------------------------------+
+bool HasOpenPosition(ENUM_ORDER_TYPE orderType)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      
+      if(orderType == ORDER_TYPE_BUY && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+         return true;
+      if(orderType == ORDER_TYPE_SELL && PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Close all positions of specific type                               |
+//+------------------------------------------------------------------+
+void CloseAllPositions(ENUM_POSITION_TYPE posType)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE) != posType) continue;
+      
+      m_trade.PositionClose(ticket);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Reset BUY state variables                                          |
+//+------------------------------------------------------------------+
+void ResetBuyState()
+{
+   m_inMartingaleBuy = false;
+   m_buyOrderCount = 0;
+   m_combinedBuyTP = 0;
+   m_totalBuyLots = 0;
+   m_weightedBuyPrice = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Reset SELL state variables                                         |
+//+------------------------------------------------------------------+
+void ResetSellState()
+{
+   m_inMartingaleSell = false;
+   m_sellOrderCount = 0;
+   m_combinedSellTP = 0;
+   m_totalSellLots = 0;
+   m_weightedSellPrice = 0;
+}
+
+//+------------------------------------------------------------------+
+//| Restore martingale state from existing positions                   |
+//+------------------------------------------------------------------+
+void RestoreMartingaleState()
+{
+   double totalBuyLots = 0, totalSellLots = 0;
+   double weightedBuyPrice = 0, weightedSellPrice = 0;
+   int buyCount = 0, sellCount = 0;
+   double buyTP = 0, sellTP = 0;
+   
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      
+      double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double posLots = PositionGetDouble(POSITION_VOLUME);
+      double posTP = PositionGetDouble(POSITION_TP);
+      
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      {
+         totalBuyLots += posLots;
+         weightedBuyPrice += posPrice * posLots;
+         buyCount++;
+         if(posTP > buyTP) buyTP = posTP;
+      }
+      else
+      {
+         totalSellLots += posLots;
+         weightedSellPrice += posPrice * posLots;
+         sellCount++;
+         if(sellTP == 0 || posTP < sellTP) sellTP = posTP;
+      }
+   }
+   
+   if(buyCount > 0)
+   {
+      m_inMartingaleBuy = true;
+      m_buyOrderCount = buyCount;
+      m_totalBuyLots = totalBuyLots;
+      m_weightedBuyPrice = weightedBuyPrice / totalBuyLots;
+      m_combinedBuyTP = buyTP;
+   }
+   
+   if(sellCount > 0)
+   {
+      m_inMartingaleSell = true;
+      m_sellOrderCount = sellCount;
+      m_totalSellLots = totalSellLots;
+      m_weightedSellPrice = weightedSellPrice / totalSellLots;
+      m_combinedSellTP = sellTP;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Trade Transaction Event Handler                                    |
+//+------------------------------------------------------------------+
+void OnTrade()
+{
+   // Handle any trade events if needed
+}
+
+//+------------------------------------------------------------------+
+//| OnTester - for optimization                                        |
+//+------------------------------------------------------------------+
+double OnTester()
+{
+   double ret = 0.0;
+   return(ret);
+}
+//+------------------------------------------------------------------+
